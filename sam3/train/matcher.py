@@ -12,21 +12,89 @@ from scipy.optimize import linear_sum_assignment
 from torch import nn
 
 
+# def _do_matching(cost, repeats=1, return_tgt_indices=False, do_filtering=False):
+#     if repeats > 1:
+#         cost = np.tile(cost, (1, repeats))
+#     if isinstance(cost, torch.Tensor):
+#         cost_cpu = cost.detach().cpu()
+#         finite_mask = torch.isfinite(cost_cpu)
+#         if not finite_mask.all():
+#             print(">>> INVALID COST DETECTED <<<")
+#             print(" shape:", cost_cpu.shape)
+#             print(" has_nan:", torch.isnan(cost_cpu).any().item())
+#             print(" has_inf:", torch.isinf(cost_cpu).any().item())
+#             print(" min:", cost_cpu[finite_mask].min().item() if finite_mask.any() else None)
+#             print(" max:", cost_cpu[finite_mask].max().item() if finite_mask.any() else None)
+#             # 你可以顺便把 batch 的一些 index 打出来，比如 image_id, epoch, step 等
+#             raise RuntimeError("Cost matrix contains NaN/Inf before linear_sum_assignment")
+#     i, j = linear_sum_assignment(cost)
+#     if do_filtering:
+#         # filter out invalid entries (i.e. those with cost > 1e8)
+#         valid_thresh = 1e8
+#         valid_ijs = [(ii, jj) for ii, jj in zip(i, j) if cost[ii, jj] < valid_thresh]
+#         i, j = zip(*valid_ijs) if len(valid_ijs) > 0 else ([], [])
+#         i, j = np.array(i, dtype=np.int64), np.array(j, dtype=np.int64)
+#     if return_tgt_indices:
+#         return i, j
+#     order = np.argsort(j)
+#     return i[order]
 def _do_matching(cost, repeats=1, return_tgt_indices=False, do_filtering=False):
-    if repeats > 1:
-        cost = np.tile(cost, (1, repeats))
+    # 1. 统一转成 numpy
+    if isinstance(cost, torch.Tensor):
+        cost_np = cost.detach().cpu().numpy()
+    else:
+        cost_np = np.asarray(cost)
 
-    i, j = linear_sum_assignment(cost)
+    # 2. 处理 repeats（o2m）
+    if repeats > 1:
+        cost_np = np.tile(cost_np, (1, repeats))
+
+    # 3. 检查 NaN / Inf
+    finite_mask = np.isfinite(cost_np)
+    if not finite_mask.all():
+        print(">>> INVALID COST DETECTED <<<")
+        print("  shape:", cost_np.shape)
+        print("  has_nan:", np.isnan(cost_np).any())
+        print("  has_inf:", np.isinf(cost_np).any())
+
+        # if finite_mask.any():
+        #     # 部分 finite，部分 NaN/Inf：把 NaN/Inf 替换成一个很大的数
+        #     finite_vals = cost_np[finite_mask]
+        #     max_finite = finite_vals.max()
+        #     fill_value = max_finite + abs(max_finite) + 1e4
+        #     cost_np[~finite_mask] = fill_value
+        #     print("  -> replaced non-finite entries with", fill_value)
+        # else:
+        #     # 整个矩阵都 NaN/Inf：直接用一个常数填充，不再返回空
+        #     print("  -> all entries are non-finite; filling with large finite value and continuing")
+        #     fill_value = 1e6
+        #     cost_np[...] = fill_value
+        raise RuntimeError("Cost matrix contains NaN/Inf before linear_sum_assignment")
+
+    # 4. 空矩阵保险
+    if cost_np.size == 0:
+        if return_tgt_indices:
+            empty = np.zeros((0,), dtype=np.int64)
+            return empty, empty
+        else:
+            return np.zeros((0,), dtype=np.int64)
+
+    # 5. Hungarian
+    i, j = linear_sum_assignment(cost_np)
+
+    # 6. 可选过滤
     if do_filtering:
-        # filter out invalid entries (i.e. those with cost > 1e8)
         valid_thresh = 1e8
-        valid_ijs = [(ii, jj) for ii, jj in zip(i, j) if cost[ii, jj] < valid_thresh]
-        i, j = zip(*valid_ijs) if len(valid_ijs) > 0 else ([], [])
-        i, j = np.array(i, dtype=np.int64), np.array(j, dtype=np.int64)
+        valid_mask = cost_np[i, j] < valid_thresh
+        i, j = i[valid_mask], j[valid_mask]
+
     if return_tgt_indices:
         return i, j
+
     order = np.argsort(j)
     return i[order]
+
+
 
 
 class HungarianMatcher(nn.Module):
@@ -567,8 +635,36 @@ class BinaryHungarianMatcherV2(nn.Module):
         assert out_bbox.shape[0] == tgt_bbox.shape[0]
         assert out_bbox.shape[0] == num_boxes.shape[0]
 
+        # ======== Debug: 检查 out_bbox / tgt_bbox 是否有 NaN / Inf ========
+        if not torch.isfinite(out_bbox).all():
+            print(">>> INVALID out_bbox DETECTED in BinaryHungarianMatcherV2 <<<")
+            finite_ratio = torch.isfinite(out_bbox).float().mean().item()
+            print("  out_bbox shape:", out_bbox.shape)
+            print("  finite ratio:", finite_ratio)
+            print("  any NaN:", torch.isnan(out_bbox).any().item())
+            print("  any Inf:", torch.isinf(out_bbox).any().item())
+
+        if not torch.isfinite(tgt_bbox).all():
+            print(">>> INVALID tgt_bbox DETECTED in BinaryHungarianMatcherV2 <<<")
+            finite_ratio = torch.isfinite(tgt_bbox).float().mean().item()
+            print("  tgt_bbox shape:", tgt_bbox.shape)
+            print("  finite ratio:", finite_ratio)
+            print("  any NaN:", torch.isnan(tgt_bbox).any().item())
+            print("  any Inf:", torch.isinf(tgt_bbox).any().item())
+            # 如果想更狠一点，可以把有问题的 sample 打出来一两条：
+            # print("  tgt_bbox example:", tgt_bbox[0])
+        # ================================================================
+
+
+
+
         # Compute the L1 cost between boxes
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+
+        if not torch.isfinite(cost_bbox).all():
+            print(">>> INVALID cost_bbox DETECTED <<<")
+            print("  shape:", cost_bbox.shape)
+            print("  finite ratio:", torch.isfinite(cost_bbox).float().mean().item())
 
         # Compute the giou cost betwen boxes
         cost_giou = -generalized_box_iou(

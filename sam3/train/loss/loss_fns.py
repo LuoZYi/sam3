@@ -122,6 +122,8 @@ def _dice_loss(inputs, targets, num_boxes, loss_on_multimask=False, reduce=True)
         return loss
     return loss.sum() / num_boxes
 
+import traceback
+
 
 def sigmoid_focal_loss(
     inputs,
@@ -150,12 +152,53 @@ def sigmoid_focal_loss(
     """
     if not (0 <= alpha <= 1) and triton:
         raise RuntimeError(f"Alpha should be in [0,1], got {alpha}")
-    if triton:
-        if reduce and not loss_on_multimask:
-            loss = triton_sigmoid_focal_loss_reduce(inputs, targets, alpha, gamma)
-            return loss / (num_boxes * inputs.shape[1])
+    
+    # ---- DEBUG / GUARD START ----
+    # (A) quick finite check
+    if not torch.isfinite(inputs).all():
+        bad = (~torch.isfinite(inputs)).nonzero(as_tuple=False)
+        logging.error(
+            f"[sigmoid_focal_loss] NON-FINITE inputs: "
+            f"min={inputs.nan_to_num().min().item():.4g} "
+            f"max={inputs.nan_to_num().max().item():.4g} "
+            f"shape={tuple(inputs.shape)} dtype={inputs.dtype} device={inputs.device} "
+            f"bad_count={bad.shape[0]}"
+        )
+        logging.error("".join(traceback.format_stack(limit=6)))
+        # optional: raise immediately to stop exactly at first occurrence
+        raise RuntimeError("Non-finite inputs to sigmoid_focal_loss")
 
-        loss = triton_sigmoid_focal_loss(inputs, targets, alpha, gamma)
+    if not torch.isfinite(targets).all():
+        logging.error(
+            f"[sigmoid_focal_loss] NON-FINITE targets: "
+            f"min={targets.nan_to_num().min().item():.4g} "
+            f"max={targets.nan_to_num().max().item():.4g} "
+            f"shape={tuple(targets.shape)} dtype={targets.dtype}"
+        )
+        logging.error("".join(traceback.format_stack(limit=6)))
+        raise RuntimeError("Non-finite targets to sigmoid_focal_loss")
+
+    # (B) check target value range (should usually be [0,1])
+    tmin = float(targets.min().item()) if targets.numel() else 0.0
+    tmax = float(targets.max().item()) if targets.numel() else 0.0
+    if tmin < -1e-3 or tmax > 1.0 + 1e-3:
+        logging.error(f"[sigmoid_focal_loss] targets out of [0,1]: min={tmin}, max={tmax}")
+        # not always fatal, but suspicious—raise for now
+        raise RuntimeError("Targets out of expected [0,1] range")
+    # Clamp logits to avoid sigmoid -> {0,1} -> log(0) in focal loss
+    inputs = inputs.clamp(min=-20.0, max=20.0)
+
+    triton = False
+    if triton:
+        try:
+            if reduce and not loss_on_multimask:
+                loss = triton_sigmoid_focal_loss_reduce(inputs, targets, alpha, gamma)
+                return loss / (num_boxes * inputs.shape[1])
+
+            loss = triton_sigmoid_focal_loss(inputs, targets, alpha, gamma)
+        except Exception as e:
+            logging.error(f"[sigmoid_focal_loss] Triton failed ({type(e).__name__}): {e}. Falling back to PyTorch.")
+            triton = False  # fall through
     else:
         prob = inputs.sigmoid()
         ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
@@ -553,6 +596,12 @@ class Boxes(LossWithWeights):
             else targets["boxes_xyxy"][indices[2]]
         )
 
+        if src_boxes.numel() == 0 or target_boxes.numel() == 0:
+            zero = src_boxes.sum() * 0.0  # 正确 dtype + device
+            return {
+                "loss_bbox": zero,
+                "loss_giou": zero,
+            }
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
 
         losses = {}

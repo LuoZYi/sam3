@@ -576,6 +576,28 @@ class Sam3Image(torch.nn.Module):
         return previous_stages_out
 
     def _compute_matching(self, out, targets):
+        # ======== Debug: 检查 pred_boxes 在进 matcher 之前是不是已经 NaN 了 ========
+        if torch.isnan(out["pred_boxes"]).any():
+            print(">>> NaN pred_boxes BEFORE matcher in _compute_matching <<<")
+            print("  pred_boxes shape:", out["pred_boxes"].shape)
+            mask = ~torch.isfinite(out["pred_boxes"])
+            # 哪些 query 出问题
+            bad_rows = mask.any(dim=-1)   # (B, Q)
+            print("  bad rows per batch:", bad_rows.sum(dim=1))
+
+            # 打印一点点例子，防止 log 爆炸
+            b0 = bad_rows.nonzero(as_tuple=False)[0]   # 取第一个坏样本 (batch_idx, query_idx)
+            bi, qi = int(b0[0]), int(b0[1])
+            print("  example bad box:", out["pred_boxes"][bi, qi])
+
+            # 同时看看 target，是不是某个 sample 的 GT 特别怪
+            print("  targets num_boxes:", targets["num_boxes"])
+            print("  first few target boxes:", targets["boxes"][:5])
+
+            # 这里直接抛错，让训练在 “第一次 NaN” 的地方停下
+            raise RuntimeError("NaN in pred_boxes before matcher")
+        # ================================================================
+        
         out["indices"] = self.matcher(out, targets)
         for aux_out in out.get("aux_outputs", []):
             aux_out["indices"] = self.matcher(aux_out, targets)
@@ -594,7 +616,15 @@ class Sam3Image(torch.nn.Module):
             "object_ids_packed": targets.object_ids,
             "object_ids_padded": targets.object_ids_padded,
         }
+
+        boxes = batched_targets["boxes"]
+        if not torch.isfinite(boxes).all():
+            print(">>> INVALID BOXES DETECTED in back_convert <<<")
+            print(" boxes:", boxes)
+            raise RuntimeError("NaN/Inf in target boxes")
+
         return batched_targets
+
 
     def predict_inst(
         self,
